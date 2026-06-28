@@ -4,13 +4,15 @@ from pathlib import Path
 import torch
 
 from core.data import FEATURE_COLUMNS, generate_multimagnet_dataset
+from core.baselines import newmark_beta_baseline
 from core.model import MaglevModel
-from core.physics import compute_physics_loss
+from core.physics import compute_magnetic_field_loss, compute_beam_pde_loss, compute_physics_loss
 from services.maglev_service import MaglevService
 
 
 PYTHON_FILES = [
     "core/data.py",
+    "core/baselines.py",
     "core/evaluator.py",
     "core/model.py",
     "core/physics.py",
@@ -52,7 +54,12 @@ def check_smoke():
         "lambda_reconstruction": 0.02,
         "use_structural_loss": True,
         "structural_weight": 0.1,
+        "field_weight": 0.05,
+        "field_div_scale": 1e-4,
+        "field_flux_scale": 1e-3,
+        "field_boundary_scale": 1e-3,
         "initial_weight": 1.0,
+        "beam_ei": 8.0,
         "lr": 0.001,
     }
 
@@ -61,6 +68,8 @@ def check_smoke():
     output = model(bundle.seq, t, bundle.currents, return_aux=True)
     assert output["gap"].shape == bundle.target_gap.shape
     assert output["reconstruction"].shape == bundle.seq.shape
+    assert output["spatial_attention"].shape[-2:] == (3, 3)
+    assert output["temporal_attention"].shape[-2:] == (6, 6)
     physics_loss = compute_physics_loss(
         output["gap"],
         t,
@@ -68,10 +77,30 @@ def check_smoke():
         params,
         initial_gap=bundle.target_gap[0],
         beam_disp=bundle.beam_disp,
+        beam_field=bundle.beam_field,
+        x_grid=bundle.x_grid,
+        field_potential=bundle.field_potential,
+        flux_density=bundle.flux_density,
+        boundary=bundle.boundary,
     )
     assert torch.isfinite(physics_loss)
+    beam_loss = compute_beam_pde_loss(bundle.beam_field, t, bundle.x_grid, output["gap"], params)
+    field_loss = compute_magnetic_field_loss(
+        output["gap"],
+        bundle.currents,
+        bundle.x_grid,
+        bundle.flux_density,
+        bundle.boundary,
+        params,
+    )
+    assert torch.isfinite(beam_loss)
+    assert torch.isfinite(field_loss)
 
-    for mode in ["data_only", "pinn", "ae_pinn"]:
+    baseline, elapsed_ms = newmark_beta_baseline(bundle.t, bundle.currents, params, initial_gap=bundle.target_gap[0])
+    assert baseline.shape == bundle.target_gap.shape
+    assert elapsed_ms >= 0.0
+
+    for mode in ["data_only", "pinn", "ae_pinn", "self_supervised"]:
         service = MaglevService(params, num_magnets=3, feature_dim=len(FEATURE_COLUMNS), window=6, latent_dim=16)
         history = service.train(
             bundle.seq,
@@ -79,12 +108,19 @@ def check_smoke():
             bundle.currents,
             bundle.target_gap,
             beam_disp=bundle.beam_disp,
+            beam_field=bundle.beam_field,
+            x_grid=bundle.x_grid,
+            field_potential=bundle.field_potential,
+            flux_density=bundle.flux_density,
+            boundary=bundle.boundary,
             mode=mode,
             epochs=2,
         )
         pred = service.predict(bundle.seq, bundle.t, bundle.currents)
         assert pred.shape == bundle.target_gap.shape
         assert len(history["total"]) == 2
+        if mode == "self_supervised":
+            assert history["data"][-1] == 0.0
         print(f"SMOKE_OK {mode} total={history['total'][-1]:.6f}")
 
 

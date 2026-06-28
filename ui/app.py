@@ -15,6 +15,7 @@ PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if PROJECT_ROOT not in sys.path:
     sys.path.insert(0, PROJECT_ROOT)
 
+from core.baselines import compare_with_newmark
 from core.data import FEATURE_COLUMNS, generate_multimagnet_dataset, load_csv_dataset
 from services.maglev_service import MaglevService
 
@@ -30,6 +31,7 @@ MODE_LABELS = {
     "data_only": "Data-only 基线",
     "pinn": "耦合 PINN",
     "ae_pinn": "自编码器 PINN",
+    "self_supervised": "Self-supervised 物理自学习",
 }
 
 
@@ -44,6 +46,10 @@ def build_params(kc, use_structural_loss, lambda_physics, lambda_reconstruction)
         "physics_scale": 1e-3,
         "initial_weight": 1.0,
         "structural_weight": 0.1,
+        "field_weight": 0.05,
+        "field_div_scale": 1e-4,
+        "field_flux_scale": 1e-3,
+        "field_boundary_scale": 1e-3,
         "use_structural_loss": use_structural_loss,
         "lambda_physics": lambda_physics,
         "lambda_reconstruction": lambda_reconstruction,
@@ -87,6 +93,7 @@ def render_history(history):
         ("reconstruction", "重构损失"),
         ("initial", "初始条件"),
         ("structural", "结构残差"),
+        ("field", "磁场残差"),
     ]:
         values = history.get(key, [])
         if values and max(values) > 0:
@@ -129,17 +136,27 @@ def render_latent(full_output, t):
 
 
 def render_attention(full_output):
-    attention = full_output.get("attention")
-    if attention is None:
-        return
-    attn = attention.detach().cpu().numpy().mean(axis=0)
-    fig, ax = plt.subplots(figsize=(5, 4))
-    im = ax.imshow(attn, cmap="magma")
-    ax.set_title("自注意力时间权重")
-    ax.set_xlabel("Key 时间步")
-    ax.set_ylabel("Query 时间步")
-    fig.colorbar(im, ax=ax)
-    st.pyplot(fig)
+    c1, c2 = st.columns(2)
+    temporal = full_output.get("temporal_attention", full_output.get("attention"))
+    spatial = full_output.get("spatial_attention")
+    if temporal is not None:
+        attn = temporal.detach().cpu().numpy().mean(axis=0)
+        fig, ax = plt.subplots(figsize=(5, 4))
+        im = ax.imshow(attn, cmap="magma")
+        ax.set_title("时间自注意力权重")
+        ax.set_xlabel("Key 时间步")
+        ax.set_ylabel("Query 时间步")
+        fig.colorbar(im, ax=ax)
+        c1.pyplot(fig)
+    if spatial is not None:
+        attn = spatial.detach().cpu().numpy().mean(axis=0)
+        fig, ax = plt.subplots(figsize=(5, 4))
+        im = ax.imshow(attn, cmap="viridis")
+        ax.set_title("电磁铁空间注意力权重")
+        ax.set_xlabel("Key 电磁铁")
+        ax.set_ylabel("Query 电磁铁")
+        fig.colorbar(im, ax=ax)
+        c2.pyplot(fig)
 
 
 st.sidebar.header("数据与模型配置")
@@ -190,6 +207,11 @@ with tab_train:
                 dataset.currents,
                 dataset.target_gap,
                 beam_disp=dataset.beam_disp,
+                beam_field=dataset.beam_field,
+                x_grid=dataset.x_grid,
+                field_potential=dataset.field_potential,
+                flux_density=dataset.flux_density,
+                boundary=dataset.boundary,
                 mode=mode,
                 epochs=epochs,
             )
@@ -222,11 +244,12 @@ with tab_train:
         )
 
 with tab_compare:
-    if st.button("运行 Data-only / PINN / AE-PINN 对比", type="primary", key="compare"):
+    if st.button("运行 Data-only / PINN / AE-PINN / Self-supervised 对比", type="primary", key="compare"):
         results = []
         preds = {}
         progress = st.progress(0)
-        for idx, mode in enumerate(["data_only", "pinn", "ae_pinn"], start=1):
+        mode_order = ["data_only", "pinn", "ae_pinn", "self_supervised"]
+        for idx, mode in enumerate(mode_order, start=1):
             service = make_service(params, num_magnets, window, latent_dim)
             history = service.train(
                 dataset.seq,
@@ -234,6 +257,11 @@ with tab_compare:
                 dataset.currents,
                 dataset.target_gap,
                 beam_disp=dataset.beam_disp,
+                beam_field=dataset.beam_field,
+                x_grid=dataset.x_grid,
+                field_potential=dataset.field_potential,
+                flux_density=dataset.flux_density,
+                boundary=dataset.boundary,
                 mode=mode,
                 epochs=epochs,
             )
@@ -242,11 +270,35 @@ with tab_compare:
             metrics["模式"] = MODE_LABELS[mode]
             metrics["最终物理残差"] = history["physics"][-1]
             metrics["最终重构损失"] = history["reconstruction"][-1]
+            metrics["最终梁 PDE 残差"] = history["structural"][-1]
+            metrics["最终磁场残差"] = history["field"][-1]
             results.append(metrics)
             preds[mode] = pred
-            progress.progress(idx / 3)
+            progress.progress(idx / len(mode_order))
 
         st.dataframe(pd.DataFrame(results).set_index("模式"), use_container_width=True)
+        if "ae_pinn" in preds:
+            baseline_info = compare_with_newmark(preds["ae_pinn"], dataset.target_gap, dataset.t, dataset.currents, params)
+            st.subheader("传统 Newmark-beta 基准")
+            st.dataframe(
+                pd.DataFrame(
+                    [
+                        {
+                            "方法": "Newmark-beta",
+                            "MSE": baseline_info["newmark_mse"],
+                            "MAE": baseline_info["newmark_mae"],
+                            "耗时 ms": baseline_info["elapsed_ms"],
+                        },
+                        {
+                            "方法": "AE-PINN",
+                            "MSE": baseline_info["model_mse"],
+                            "MAE": metric_dict(dataset.target_gap, preds["ae_pinn"])["MAE"],
+                            "耗时 ms": None,
+                        },
+                    ]
+                ).set_index("方法"),
+                use_container_width=True,
+            )
         fig, ax = plt.subplots(figsize=(10, 4))
         t_np = dataset.t.detach().cpu().numpy().reshape(-1)
         ax.plot(t_np, dataset.target_gap[:, 0].detach().cpu().numpy(), "k-", alpha=0.25, lw=3, label="参考间隙")
