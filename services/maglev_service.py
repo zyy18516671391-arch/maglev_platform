@@ -29,9 +29,11 @@ class MaglevService:
         beam_disp=None,
         beam_field=None,
         x_grid=None,
+        magnet_positions=None,
         field_potential=None,
         flux_density=None,
         boundary=None,
+        train_indices=None,
         mode="ae_pinn",
         epochs=600,
     ):
@@ -44,9 +46,11 @@ class MaglevService:
             beam_disp=beam_disp,
             beam_field=beam_field,
             x_grid=x_grid,
+            magnet_positions=magnet_positions,
             field_potential=field_potential,
             flux_density=flux_density,
             boundary=boundary,
+            train_indices=train_indices,
             epochs=epochs,
         )
         return history

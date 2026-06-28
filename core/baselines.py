@@ -4,11 +4,11 @@ import torch
 
 
 def newmark_beta_baseline(t, currents, params, initial_gap=None):
-    """Solve a compact linearized maglev response with Newmark-beta.
+    """Solve a compact nonlinear maglev response with Newmark-beta.
 
-    This baseline is intentionally simple: it uses the same current excitation
-    as the PINN pipeline, linearizes the electromagnetic force around the initial
-    gap, and integrates a damped second-order system for each magnet.
+    The electromagnetic force is refreshed at every step with the predicted gap
+    instead of being linearized around the initial gap. A minimum-gap guard and
+    force clamp keep the lightweight baseline numerically bounded.
     """
     start = time.perf_counter()
     t = t.reshape(-1)
@@ -27,6 +27,8 @@ def newmark_beta_baseline(t, currents, params, initial_gap=None):
     k_struct = params.get("baseline_k", params.get("beam_k", 8.0))
     force_k = params.get("k", 2.0)
     epsilon = params.get("epsilon", 0.05)
+    min_gap = params.get("min_gap", 0.02)
+    force_limit = params.get("force_limit", 100.0)
     beta = params.get("newmark_beta", 0.25)
     gamma = params.get("newmark_gamma", 0.5)
 
@@ -35,19 +37,22 @@ def newmark_beta_baseline(t, currents, params, initial_gap=None):
     a = torch.zeros_like(x)
     x[0] = initial_gap
 
-    nominal_force = force_k * currents[0] ** 2 / (initial_gap + epsilon) ** 2
+    initial_force_gap = torch.clamp(initial_gap, min=min_gap)
+    nominal_force = force_k * currents[0] ** 2 / (initial_force_gap + epsilon) ** 2
+    nominal_force = torch.clamp(nominal_force, max=force_limit)
     a[0] = (nominal_force - c * v[0] - k_struct * x[0]) / m
 
     for i in range(steps - 1):
         dt = torch.clamp(t[i + 1] - t[i], min=1e-4).to(device=device, dtype=dtype)
-        force_next = force_k * currents[i + 1] ** 2 / (initial_gap + epsilon) ** 2
-
         x_pred = x[i] + dt * v[i] + dt ** 2 * (0.5 - beta) * a[i]
         v_pred = v[i] + dt * (1.0 - gamma) * a[i]
+        force_gap = torch.clamp(x_pred, min=min_gap)
+        force_next = force_k * currents[i + 1] ** 2 / (force_gap + epsilon) ** 2
+        force_next = torch.clamp(force_next, max=force_limit)
         effective_mass = m + gamma * dt * c + beta * dt ** 2 * k_struct
         a_next = (force_next - c * v_pred - k_struct * x_pred) / effective_mass
 
-        x[i + 1] = x_pred + beta * dt ** 2 * a_next
+        x[i + 1] = torch.clamp(x_pred + beta * dt ** 2 * a_next, min=min_gap)
         v[i + 1] = v_pred + gamma * dt * a_next
         a[i + 1] = a_next
 
@@ -62,6 +67,7 @@ def compare_with_newmark(pred, target, t, currents, params):
     mae = torch.mean(torch.abs(baseline - target)).item()
     pred_mse = torch.mean((pred - target) ** 2).item()
     return {
+        "method": "nonlinear_newmark",
         "baseline": baseline,
         "elapsed_ms": elapsed_ms,
         "newmark_mse": mse,

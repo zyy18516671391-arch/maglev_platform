@@ -20,8 +20,41 @@ class DatasetBundle:
     field_potential: torch.Tensor
     flux_density: torch.Tensor
     boundary: dict[str, torch.Tensor]
+    magnet_positions: torch.Tensor
+    split_indices: dict[str, torch.Tensor]
     raw_features: torch.Tensor
     feature_columns: list[str]
+
+
+def _make_split_indices(length, train_ratio=0.6, val_ratio=0.2):
+    train_end = max(1, int(length * train_ratio))
+    val_end = max(train_end + 1, int(length * (train_ratio + val_ratio)))
+    val_end = min(val_end, length)
+    indices = torch.arange(length)
+    return {
+        "train": indices[:train_end].long(),
+        "val": indices[train_end:val_end].long(),
+        "test": indices[val_end:].long(),
+    }
+
+
+def _project_magnet_values_to_grid(values, magnet_positions, x_grid):
+    """Linearly project [time, magnets] values to a denser beam grid."""
+    if values.shape[1] == len(x_grid):
+        return values
+    projected = []
+    for x in x_grid:
+        if x <= magnet_positions[0]:
+            projected.append(values[:, 0])
+        elif x >= magnet_positions[-1]:
+            projected.append(values[:, -1])
+        else:
+            right = torch.searchsorted(magnet_positions, x).item()
+            left = right - 1
+            span = magnet_positions[right] - magnet_positions[left]
+            weight = (x - magnet_positions[left]) / (span + 1e-8)
+            projected.append(values[:, left] * (1 - weight) + values[:, right] * weight)
+    return torch.stack(projected, dim=1)
 
 
 def _window_tensor(
@@ -36,6 +69,7 @@ def _window_tensor(
     field_potential=None,
     flux_density=None,
     boundary=None,
+    magnet_positions=None,
 ):
     seq = []
     for start in range(features.shape[0] - window + 1):
@@ -44,7 +78,9 @@ def _window_tensor(
     offset = window - 1
     steps, num_magnets = target_gap.shape
     if x_grid is None:
-        x_grid = torch.linspace(0.0, 1.0, num_magnets)
+        x_grid = torch.linspace(0.0, 1.0, 33)
+    if magnet_positions is None:
+        magnet_positions = torch.linspace(0.0, 1.0, num_magnets)
     if beam_field is None:
         beam_field = beam_disp
     if field_potential is None:
@@ -59,6 +95,12 @@ def _window_tensor(
             "field_left": field_potential[:, 0:1].clone(),
             "field_right": field_potential[:, -1:].clone(),
         }
+    aligned_boundary = {}
+    for key, value in boundary.items():
+        if value.ndim > 1 and value.shape[0] == len(t):
+            aligned_boundary[key] = value[offset:]
+        else:
+            aligned_boundary[key] = value
 
     return DatasetBundle(
         seq=torch.stack(seq).float(),
@@ -70,7 +112,9 @@ def _window_tensor(
         x_grid=x_grid.float(),
         field_potential=field_potential[offset:].float(),
         flux_density=flux_density[offset:].float(),
-        boundary={key: value.float() for key, value in boundary.items()},
+        boundary={key: value.float() for key, value in aligned_boundary.items()},
+        magnet_positions=magnet_positions.float(),
+        split_indices=_make_split_indices(len(t) - offset),
         raw_features=features[offset:].float(),
         feature_columns=FEATURE_COLUMNS.copy(),
     )
@@ -83,10 +127,12 @@ def generate_multimagnet_dataset(
     noise_level=0.02,
     sample_ratio=1.0,
     seed=42,
+    beam_points=33,
 ):
     """Generate a compact multi-magnet dataset for prototype experiments."""
     generator = torch.Generator().manual_seed(seed)
     t = torch.linspace(0.0, 6.0, total_steps).view(-1, 1)
+    magnet_positions = torch.linspace(0.0, 1.0, num_magnets)
     magnet_axis = torch.arange(num_magnets).float().view(1, -1)
     phase = magnet_axis * math.pi / max(num_magnets, 1)
 
@@ -99,14 +145,15 @@ def generate_multimagnet_dataset(
     clean_gap = clean_gap + 0.08 * neighbor_effect
 
     beam_disp = 0.015 * torch.sin(1.1 * t + 0.4 * phase)
-    x_grid = torch.linspace(0.0, 1.0, num_magnets)
+    x_grid = torch.linspace(0.0, 1.0, beam_points)
     x_phase = x_grid.view(1, -1)
     beam_field = (
         0.012 * torch.sin(torch.pi * x_phase) * torch.sin(1.1 * t)
         + 0.004 * torch.sin(2 * torch.pi * x_phase) * torch.cos(1.8 * t)
     )
     accel = -0.035 * (1.4 ** 2) * torch.sin(1.4 * t + phase)
-    field_potential = currents / (clean_gap + 0.05) + 0.03 * torch.sin(torch.pi * x_phase)
+    magnet_shape = torch.sin(torch.pi * magnet_positions.view(1, -1))
+    field_potential = currents / (clean_gap + 0.05) + 0.03 * magnet_shape
     flux = field_potential + 0.04 * neighbor_effect
     temperature = 25.0 + 1.2 * torch.sin(0.35 * t + phase)
 
@@ -151,10 +198,11 @@ def generate_multimagnet_dataset(
         field_potential=field_potential,
         flux_density=flux,
         boundary=boundary,
+        magnet_positions=magnet_positions,
     )
 
 
-def load_csv_dataset(file_like, num_magnets=4, window=8):
+def load_csv_dataset(file_like, num_magnets=4, window=8, beam_points=33):
     """Load a CSV into the same tensor shape as the synthetic generator.
 
     Required columns are `t`, `I1..IN`, and `gap1..gapN`. Optional columns are
@@ -226,7 +274,10 @@ def load_csv_dataset(file_like, num_magnets=4, window=8):
         dim=-1,
     )
 
-    x_grid = torch.linspace(0.0, 1.0, num_magnets)
+    magnet_positions = torch.linspace(0.0, 1.0, num_magnets)
+    x_grid = torch.linspace(0.0, 1.0, beam_points)
+    if beam_field.shape[1] != beam_points:
+        beam_field = _project_magnet_values_to_grid(beam_field, magnet_positions, x_grid)
     boundary = {
         "gap_initial": gaps_t[0].clone(),
         "beam_left": beam_field[:, 0:1].clone(),
@@ -247,4 +298,5 @@ def load_csv_dataset(file_like, num_magnets=4, window=8):
         field_potential=field_potential,
         flux_density=flux_density,
         boundary=boundary,
+        magnet_positions=magnet_positions,
     )

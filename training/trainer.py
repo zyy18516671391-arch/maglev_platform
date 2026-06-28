@@ -21,9 +21,11 @@ class Trainer:
         beam_disp=None,
         beam_field=None,
         x_grid=None,
+        magnet_positions=None,
         field_potential=None,
         flux_density=None,
         boundary=None,
+        train_indices=None,
         epochs=400,
     ):
         history = {
@@ -39,6 +41,25 @@ class Trainer:
         use_physics = self.mode in {"pinn", "ae_pinn", "self_supervised"}
         use_reconstruction = self.mode in {"ae_pinn", "self_supervised"}
         initial_gap = target[0].detach()
+        if train_indices is not None:
+            train_indices = train_indices.long()
+            seq = seq[train_indices]
+            t = t[train_indices]
+            currents = currents[train_indices]
+            target = target[train_indices]
+            if beam_disp is not None:
+                beam_disp = beam_disp[train_indices]
+            if beam_field is not None:
+                beam_field = beam_field[train_indices]
+            if field_potential is not None:
+                field_potential = field_potential[train_indices]
+            if flux_density is not None:
+                flux_density = flux_density[train_indices]
+            if boundary is not None:
+                boundary = {
+                    key: value[train_indices] if value.ndim > 1 and value.shape[0] >= len(train_indices) else value
+                    for key, value in boundary.items()
+                }
 
         for _ in range(epochs):
             self.optimizer.zero_grad()
@@ -67,6 +88,7 @@ class Trainer:
                     beam_disp=beam_curr,
                     beam_field=beam_field_curr,
                     x_grid=x_grid,
+                    magnet_positions=magnet_positions,
                     field_potential=field_potential,
                     flux_density=flux_curr,
                     boundary=boundary,
