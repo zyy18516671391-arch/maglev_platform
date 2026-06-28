@@ -12,7 +12,9 @@ import torch
 from sklearn.decomposition import PCA
 from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score
 
-sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+if PROJECT_ROOT not in sys.path:
+    sys.path.insert(0, PROJECT_ROOT)
 from core.data import FEATURE_COLUMNS, generate_multimagnet_dataset, load_csv_dataset
 from services.maglev_service import MaglevService
 

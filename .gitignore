@@ -20,3 +20,4 @@ env/
 *.ckpt
 outputs/
 artifacts/
+streamlit_*.log
