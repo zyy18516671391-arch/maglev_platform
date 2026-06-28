@@ -15,22 +15,62 @@ class DatasetBundle:
     currents: torch.Tensor
     target_gap: torch.Tensor
     beam_disp: torch.Tensor
+    beam_field: torch.Tensor
+    x_grid: torch.Tensor
+    field_potential: torch.Tensor
+    flux_density: torch.Tensor
+    boundary: dict[str, torch.Tensor]
     raw_features: torch.Tensor
     feature_columns: list[str]
 
 
-def _window_tensor(features, t, currents, target_gap, beam_disp, window):
+def _window_tensor(
+    features,
+    t,
+    currents,
+    target_gap,
+    beam_disp,
+    window,
+    beam_field=None,
+    x_grid=None,
+    field_potential=None,
+    flux_density=None,
+    boundary=None,
+):
     seq = []
     for start in range(features.shape[0] - window + 1):
         seq.append(features[start:start + window])
 
     offset = window - 1
+    steps, num_magnets = target_gap.shape
+    if x_grid is None:
+        x_grid = torch.linspace(0.0, 1.0, num_magnets)
+    if beam_field is None:
+        beam_field = beam_disp
+    if field_potential is None:
+        field_potential = currents / (target_gap + 0.05)
+    if flux_density is None:
+        flux_density = field_potential
+    if boundary is None:
+        boundary = {
+            "gap_initial": target_gap[0].clone(),
+            "beam_left": beam_field[:, 0:1].clone(),
+            "beam_right": beam_field[:, -1:].clone(),
+            "field_left": field_potential[:, 0:1].clone(),
+            "field_right": field_potential[:, -1:].clone(),
+        }
+
     return DatasetBundle(
         seq=torch.stack(seq).float(),
         t=t[offset:].float(),
         currents=currents[offset:].float(),
         target_gap=target_gap[offset:].float(),
         beam_disp=beam_disp[offset:].float(),
+        beam_field=beam_field[offset:].float(),
+        x_grid=x_grid.float(),
+        field_potential=field_potential[offset:].float(),
+        flux_density=flux_density[offset:].float(),
+        boundary={key: value.float() for key, value in boundary.items()},
         raw_features=features[offset:].float(),
         feature_columns=FEATURE_COLUMNS.copy(),
     )
@@ -59,8 +99,15 @@ def generate_multimagnet_dataset(
     clean_gap = clean_gap + 0.08 * neighbor_effect
 
     beam_disp = 0.015 * torch.sin(1.1 * t + 0.4 * phase)
+    x_grid = torch.linspace(0.0, 1.0, num_magnets)
+    x_phase = x_grid.view(1, -1)
+    beam_field = (
+        0.012 * torch.sin(torch.pi * x_phase) * torch.sin(1.1 * t)
+        + 0.004 * torch.sin(2 * torch.pi * x_phase) * torch.cos(1.8 * t)
+    )
     accel = -0.035 * (1.4 ** 2) * torch.sin(1.4 * t + phase)
-    flux = currents / (clean_gap + 0.05) + 0.04 * neighbor_effect
+    field_potential = currents / (clean_gap + 0.05) + 0.03 * torch.sin(torch.pi * x_phase)
+    flux = field_potential + 0.04 * neighbor_effect
     temperature = 25.0 + 1.2 * torch.sin(0.35 * t + phase)
 
     measured_gap = clean_gap + noise_level * torch.randn(clean_gap.shape, generator=generator)
@@ -79,9 +126,32 @@ def generate_multimagnet_dataset(
         currents = currents[indices]
         clean_gap = clean_gap[indices]
         beam_disp = beam_disp[indices]
+        beam_field = beam_field[indices]
+        field_potential = field_potential[indices]
+        flux = flux[indices]
         features = features[indices]
 
-    return _window_tensor(features, t, currents, clean_gap, beam_disp, window)
+    boundary = {
+        "gap_initial": clean_gap[0].clone(),
+        "beam_left": beam_field[:, 0:1].clone(),
+        "beam_right": beam_field[:, -1:].clone(),
+        "field_left": field_potential[:, 0:1].clone(),
+        "field_right": field_potential[:, -1:].clone(),
+    }
+
+    return _window_tensor(
+        features,
+        t,
+        currents,
+        clean_gap,
+        beam_disp,
+        window,
+        beam_field=beam_field,
+        x_grid=x_grid,
+        field_potential=field_potential,
+        flux_density=flux,
+        boundary=boundary,
+    )
 
 
 def load_csv_dataset(file_like, num_magnets=4, window=8):
@@ -100,6 +170,8 @@ def load_csv_dataset(file_like, num_magnets=4, window=8):
     flux = []
     accel = []
     beam = []
+    beam_field_cols = []
+    field_potential_cols = []
     temp = []
 
     for i in range(1, num_magnets + 1):
@@ -132,13 +204,47 @@ def load_csv_dataset(file_like, num_magnets=4, window=8):
         accel.append(accel_i)
         beam.append(beam_i)
         temp.append(temp_i)
+        if f"beam_field{i}" in df.columns:
+            beam_field_i = torch.tensor(df[f"beam_field{i}"].to_numpy(), dtype=torch.float32)
+        else:
+            beam_field_i = beam_i
+        if f"field_potential{i}" in df.columns:
+            potential_i = torch.tensor(df[f"field_potential{i}"].to_numpy(), dtype=torch.float32)
+        else:
+            potential_i = flux_i
+        beam_field_cols.append(beam_field_i)
+        field_potential_cols.append(potential_i)
 
     currents_t = torch.stack(currents, dim=1)
     gaps_t = torch.stack(gaps, dim=1)
     beam_t = torch.stack(beam, dim=1)
+    beam_field = torch.stack(beam_field_cols, dim=1)
+    field_potential = torch.stack(field_potential_cols, dim=1)
+    flux_density = torch.stack(flux, dim=1)
     features = torch.stack(
-        [currents_t, gaps_t, torch.stack(flux, dim=1), torch.stack(accel, dim=1), beam_t, torch.stack(temp, dim=1)],
+        [currents_t, gaps_t, flux_density, torch.stack(accel, dim=1), beam_t, torch.stack(temp, dim=1)],
         dim=-1,
     )
 
-    return _window_tensor(features, t, currents_t, gaps_t, beam_t, window)
+    x_grid = torch.linspace(0.0, 1.0, num_magnets)
+    boundary = {
+        "gap_initial": gaps_t[0].clone(),
+        "beam_left": beam_field[:, 0:1].clone(),
+        "beam_right": beam_field[:, -1:].clone(),
+        "field_left": field_potential[:, 0:1].clone(),
+        "field_right": field_potential[:, -1:].clone(),
+    }
+
+    return _window_tensor(
+        features,
+        t,
+        currents_t,
+        gaps_t,
+        beam_t,
+        window,
+        beam_field=beam_field,
+        x_grid=x_grid,
+        field_potential=field_potential,
+        flux_density=flux_density,
+        boundary=boundary,
+    )

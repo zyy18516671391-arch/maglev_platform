@@ -20,9 +20,35 @@ class MaglevService:
             latent_dim=latent_dim,
         )
 
-    def train(self, seq, t, currents, target, beam_disp=None, mode="ae_pinn", epochs=600):
+    def train(
+        self,
+        seq,
+        t,
+        currents,
+        target,
+        beam_disp=None,
+        beam_field=None,
+        x_grid=None,
+        field_potential=None,
+        flux_density=None,
+        boundary=None,
+        mode="ae_pinn",
+        epochs=600,
+    ):
         trainer = Trainer(self.model, self.params, mode=mode)
-        self.model, history = trainer.train(seq, t, currents, target, beam_disp=beam_disp, epochs=epochs)
+        self.model, history = trainer.train(
+            seq,
+            t,
+            currents,
+            target,
+            beam_disp=beam_disp,
+            beam_field=beam_field,
+            x_grid=x_grid,
+            field_potential=field_potential,
+            flux_density=flux_density,
+            boundary=boundary,
+            epochs=epochs,
+        )
         return history
 
     def predict(self, seq, t, currents):
