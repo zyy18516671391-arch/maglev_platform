@@ -21,8 +21,10 @@ class MSA_CAE(nn.Module):
 
         self.conv_short = nn.Conv1d(self.in_channels, hidden, kernel_size=3, padding=1)
         self.conv_long = nn.Conv1d(self.in_channels, hidden, kernel_size=5, padding=2)
-        self.attn = nn.MultiheadAttention(embed_dim=hidden * 2, num_heads=4, batch_first=True)
-        self.to_latent = nn.Sequential(nn.Linear(hidden * 2, latent_dim), nn.Tanh())
+        self.temporal_attn = nn.MultiheadAttention(embed_dim=hidden * 2, num_heads=4, batch_first=True)
+        self.spatial_projection = nn.Linear(feature_dim, hidden * 2)
+        self.spatial_attn = nn.MultiheadAttention(embed_dim=hidden * 2, num_heads=4, batch_first=True)
+        self.to_latent = nn.Sequential(nn.Linear(hidden * 4, latent_dim), nn.Tanh())
         self.decoder_seed = nn.Linear(latent_dim, hidden * self.window)
         self.decoder = nn.Sequential(
             nn.ConvTranspose1d(hidden, hidden, kernel_size=3, padding=1),
@@ -39,8 +41,27 @@ class MSA_CAE(nn.Module):
         long_feat = F.relu(self.conv_long(x))
         features = torch.cat([short_feat, long_feat], dim=1).permute(0, 2, 1)
 
-        attended, attention = self.attn(features, features, features, need_weights=True)
-        latent = self.to_latent(attended.mean(dim=1))
+        temporal_attended, temporal_attention = self.temporal_attn(
+            features,
+            features,
+            features,
+            need_weights=True,
+        )
+
+        magnet_tokens = seq.mean(dim=1)
+        magnet_tokens = self.spatial_projection(magnet_tokens)
+        spatial_attended, spatial_attention = self.spatial_attn(
+            magnet_tokens,
+            magnet_tokens,
+            magnet_tokens,
+            need_weights=True,
+        )
+
+        latent_input = torch.cat(
+            [temporal_attended.mean(dim=1), spatial_attended.mean(dim=1)],
+            dim=1,
+        )
+        latent = self.to_latent(latent_input)
 
         decoded = self.decoder_seed(latent).reshape(batch, 32, self.window)
         reconstruction = self.decoder(decoded).permute(0, 2, 1)
@@ -49,7 +70,9 @@ class MSA_CAE(nn.Module):
         return {
             "latent": latent,
             "reconstruction": reconstruction,
-            "attention": attention,
+            "attention": temporal_attention,
+            "temporal_attention": temporal_attention,
+            "spatial_attention": spatial_attention,
         }
 
 
@@ -82,5 +105,7 @@ class MaglevModel(nn.Module):
                 "reconstruction": encoded["reconstruction"],
                 "latent": encoded["latent"],
                 "attention": encoded["attention"],
+                "temporal_attention": encoded["temporal_attention"],
+                "spatial_attention": encoded["spatial_attention"],
             }
         return gaps
