@@ -1,5 +1,12 @@
 import torch
 
+from core.field import (
+    compute_field_quantities,
+    legacy_gradient_force,
+    scalar_potential_from_gap,
+    select_field_force,
+)
+
 
 def _safe_grad(value, t):
     """Return d(value)/dt, or zeros when value is not connected to t."""
@@ -75,15 +82,11 @@ def compute_field_proxy_force(pred, currents, x_grid, magnet_positions, params):
     """Map a quasi-1D magnetic-gradient proxy back to magnet force locations."""
     if magnet_positions is None:
         return torch.zeros_like(pred)
-    epsilon = params.get("epsilon", 0.05)
-    potential = currents.reshape_as(pred) / (torch.clamp(pred, min=1e-4) + epsilon)
     magnet_grid = magnet_positions.to(device=pred.device, dtype=pred.dtype)
-    flux_at_magnets = -_spatial_first(potential, magnet_grid)
-    force_scale = params.get("field_force_scale", 0.1)
-    return force_scale * flux_at_magnets ** 2
+    return legacy_gradient_force(pred, currents, magnet_grid, params)
 
 
-def compute_magnet_balance_loss(pred, t, currents, params, x_grid=None, magnet_positions=None):
+def compute_magnet_balance_loss(pred, t, currents, params, x_grid=None, magnet_positions=None, field_potential=None):
     """Multi-magnet force-balance residual."""
     gaps = torch.clamp(pred, min=1e-4)
     currents = currents.reshape_as(gaps)
@@ -106,13 +109,45 @@ def compute_magnet_balance_loss(pred, t, currents, params, x_grid=None, magnet_p
     acceleration = torch.cat(accelerations, dim=1)
 
     engineering_force = k * currents ** 2 / (gaps + epsilon) ** 2
-    field_force = compute_field_proxy_force(gaps, currents, x_grid, magnet_positions, params)
-    blend = torch.clamp(torch.tensor(params.get("field_force_blend", 0.0), device=gaps.device, dtype=gaps.dtype), 0.0, 1.0)
-    electromagnetic_force = (1.0 - blend) * engineering_force + blend * field_force
+    field_grid = magnet_positions if magnet_positions is not None else x_grid
+    electromagnetic_force, field_components = select_field_force(
+        gaps,
+        currents,
+        field_grid,
+        params,
+        engineering_force=engineering_force,
+        field_potential=field_potential,
+    )
     coupling_force = _adjacent_coupling(gaps, kc)
     balance = m * acceleration + c * velocity + coupling_force - (electromagnetic_force - m * g)
     loss = torch.mean(balance ** 2) * params.get("physics_scale", 1e-3)
-    return loss, electromagnetic_force
+    return loss, electromagnetic_force, field_components
+
+
+def beam_ei_profile(x_grid, params):
+    """Piecewise EI(x) for beam, functional part, and joint segments."""
+    x = x_grid.to(dtype=torch.float32)
+    base = params.get("beam_ei", params.get("beam_k", 8.0))
+    function_scale = params.get("functional_ei_scale", 0.75)
+    joint_scale = params.get("joint_ei_scale", 0.55)
+    profile = torch.full_like(x, float(base))
+    function_mask = (x >= 0.35) & (x <= 0.65)
+    joint_mask = ((x >= 0.18) & (x <= 0.24)) | ((x >= 0.76) & (x <= 0.82))
+    profile[function_mask] = float(base) * function_scale
+    profile[joint_mask] = float(base) * joint_scale
+    return profile
+
+
+def slot_force_profile(x_grid, params, device, dtype):
+    """First three spatial harmonics for long-stator cogging excitation."""
+    x = x_grid.to(device=device, dtype=dtype).reshape(1, -1)
+    pitch = max(params.get("slot_pitch", 0.6), 1e-6)
+    total = torch.zeros_like(x)
+    for order in range(1, int(params.get("slot_harmonics", 3)) + 1):
+        amp = params.get(f"slot_amp_{order}", params.get("slot_amp", 0.03) / order)
+        phase = params.get(f"slot_phase_{order}", 0.0)
+        total = total + amp * torch.sin(2 * torch.pi * order * x / pitch + phase)
+    return total
 
 
 def compute_beam_pde_loss(beam_field, t, x_grid, electromagnetic_load, params, magnet_positions=None):
@@ -127,10 +162,8 @@ def compute_beam_pde_loss(beam_field, t, x_grid, electromagnetic_load, params, m
     bending = _spatial_fourth(beam_field, x_grid)
     rho_a = params.get("rho_a", 1.0)
     damping = params.get("beam_c", 0.08)
-    ei = params.get("beam_ei", params.get("beam_k", 8.0))
-    slot_amp = params.get("slot_amp", 0.03)
-    slot_pitch = params.get("slot_pitch", 0.6)
-    slot_force = slot_amp * torch.sin(2 * torch.pi * x_grid.to(t.device).reshape(1, -1) / max(slot_pitch, 1e-6))
+    ei = beam_ei_profile(x_grid, params).to(device=t.device, dtype=t.dtype).reshape(1, -1)
+    slot_force = slot_force_profile(x_grid, params, device=t.device, dtype=t.dtype)
     if magnet_positions is not None:
         load = project_magnet_load_to_beam_grid(electromagnetic_load, magnet_positions, x_grid)
     else:
@@ -141,7 +174,17 @@ def compute_beam_pde_loss(beam_field, t, x_grid, electromagnetic_load, params, m
     return torch.mean(residual ** 2)
 
 
-def compute_magnetic_field_loss(pred, currents, x_grid, flux_density, boundary, params, magnet_positions=None):
+def compute_magnetic_field_loss(
+    pred,
+    currents,
+    x_grid,
+    flux_density,
+    boundary,
+    params,
+    magnet_positions=None,
+    field_potential=None,
+    return_components=False,
+):
     """Quasi-1D scalar magnetic-potential residual.
 
     This is a lightweight Maxwell-style proxy: predicted scalar magnetic
@@ -154,9 +197,16 @@ def compute_magnetic_field_loss(pred, currents, x_grid, flux_density, boundary, 
         return torch.tensor(0.0, device=pred.device, dtype=pred.dtype)
     field_grid = field_grid.to(device=pred.device, dtype=pred.dtype)
 
-    epsilon = params.get("epsilon", 0.05)
-    predicted_potential = currents.reshape_as(pred) / (torch.clamp(pred, min=1e-4) + epsilon)
-    predicted_flux = -_spatial_first(predicted_potential, field_grid)
+    predicted_potential = scalar_potential_from_gap(pred, currents, params)
+    field_components = compute_field_quantities(
+        pred,
+        currents,
+        field_grid,
+        params,
+        field_potential=field_potential,
+    )
+    predicted_potential = field_components["potential"]
+    predicted_flux = field_components["flux_density"]
     divergence = _spatial_first(predicted_flux, field_grid)
     divergence_loss = torch.mean(divergence ** 2)
 
@@ -175,7 +225,19 @@ def compute_magnetic_field_loss(pred, currents, x_grid, flux_density, boundary, 
         boundary_loss = boundary_loss + torch.mean((predicted_potential[:, -1:] - right) ** 2)
         boundary_loss = boundary_loss * params.get("field_boundary_scale", 1e-3)
 
-    return divergence_loss * params.get("field_div_scale", 1e-4) + flux_loss + boundary_loss
+    total = divergence_loss * params.get("field_div_scale", 1e-4) + flux_loss + boundary_loss
+    if return_components:
+        return total, {
+            "potential": predicted_potential,
+            "flux_density": predicted_flux,
+            "maxwell_force": field_components["maxwell_force"],
+            "pressure": field_components["pressure"],
+            "divergence": divergence_loss,
+            "flux": flux_loss,
+            "boundary": boundary_loss,
+            "total": total,
+        }
+    return total
 
 
 def compute_initial_boundary_loss(pred, initial_gap=None, beam_field=None, boundary=None):
@@ -222,16 +284,17 @@ def compute_physics_loss(
     if beam_field is None:
         beam_field = beam_disp
 
-    balance_loss, electromagnetic_force = compute_magnet_balance_loss(
+    balance_loss, electromagnetic_force, field_force_components = compute_magnet_balance_loss(
         pred,
         t,
         currents,
         params,
         x_grid=x_grid,
         magnet_positions=magnet_positions,
+        field_potential=field_potential,
     )
     beam_loss = compute_beam_pde_loss(beam_field, t, x_grid, electromagnetic_force, params, magnet_positions=magnet_positions)
-    field_loss = compute_magnetic_field_loss(
+    field_loss, field_components = compute_magnetic_field_loss(
         pred,
         currents,
         x_grid,
@@ -239,6 +302,8 @@ def compute_physics_loss(
         boundary,
         params,
         magnet_positions=magnet_positions,
+        field_potential=field_potential,
+        return_components=True,
     )
     initial_loss = compute_initial_boundary_loss(pred, initial_gap=initial_gap, beam_field=beam_field, boundary=boundary)
     total = (
@@ -254,6 +319,9 @@ def compute_physics_loss(
         "structural": beam_loss,
         "field": field_loss,
         "total": total,
+        "selected_force_mean": electromagnetic_force.mean(),
+        "maxwell_force_mean": field_force_components.get("maxwell_force", torch.zeros_like(pred)).mean(),
+        "field_divergence": field_components["divergence"],
     }
     if return_components:
         return total, components

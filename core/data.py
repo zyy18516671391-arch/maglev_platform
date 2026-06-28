@@ -22,6 +22,9 @@ class DatasetBundle:
     boundary: dict[str, torch.Tensor]
     magnet_positions: torch.Tensor
     split_indices: dict[str, torch.Tensor]
+    force_ref: torch.Tensor | None
+    case_ids: torch.Tensor
+    source_type: str
     raw_features: torch.Tensor
     feature_columns: list[str]
 
@@ -70,6 +73,9 @@ def _window_tensor(
     flux_density=None,
     boundary=None,
     magnet_positions=None,
+    force_ref=None,
+    case_ids=None,
+    source_type="synthetic",
 ):
     seq = []
     for start in range(features.shape[0] - window + 1):
@@ -87,6 +93,10 @@ def _window_tensor(
         field_potential = currents / (target_gap + 0.05)
     if flux_density is None:
         flux_density = field_potential
+    if force_ref is None:
+        force_ref = 2.0 * currents ** 2 / (torch.clamp(target_gap, min=1e-4) + 0.05) ** 2
+    if case_ids is None:
+        case_ids = torch.zeros(len(t), dtype=torch.long)
     if boundary is None:
         boundary = {
             "gap_initial": target_gap[0].clone(),
@@ -115,6 +125,9 @@ def _window_tensor(
         boundary={key: value.float() for key, value in aligned_boundary.items()},
         magnet_positions=magnet_positions.float(),
         split_indices=_make_split_indices(len(t) - offset),
+        force_ref=force_ref[offset:].float(),
+        case_ids=case_ids[offset:].long(),
+        source_type=source_type,
         raw_features=features[offset:].float(),
         feature_columns=FEATURE_COLUMNS.copy(),
     )
@@ -155,6 +168,7 @@ def generate_multimagnet_dataset(
     magnet_shape = torch.sin(torch.pi * magnet_positions.view(1, -1))
     field_potential = currents / (clean_gap + 0.05) + 0.03 * magnet_shape
     flux = field_potential + 0.04 * neighbor_effect
+    force_ref = 2.0 * currents ** 2 / (clean_gap + 0.05) ** 2 + 0.4 * flux ** 2
     temperature = 25.0 + 1.2 * torch.sin(0.35 * t + phase)
 
     measured_gap = clean_gap + noise_level * torch.randn(clean_gap.shape, generator=generator)
@@ -176,6 +190,7 @@ def generate_multimagnet_dataset(
         beam_field = beam_field[indices]
         field_potential = field_potential[indices]
         flux = flux[indices]
+        force_ref = force_ref[indices]
         features = features[indices]
 
     boundary = {
@@ -199,6 +214,8 @@ def generate_multimagnet_dataset(
         flux_density=flux,
         boundary=boundary,
         magnet_positions=magnet_positions,
+        force_ref=force_ref,
+        source_type="synthetic",
     )
 
 
@@ -269,6 +286,13 @@ def load_csv_dataset(file_like, num_magnets=4, window=8, beam_points=33):
     beam_field = torch.stack(beam_field_cols, dim=1)
     field_potential = torch.stack(field_potential_cols, dim=1)
     flux_density = torch.stack(flux, dim=1)
+    force_ref_cols = []
+    for i in range(1, num_magnets + 1):
+        if f"force_ref{i}" in df.columns:
+            force_ref_cols.append(torch.tensor(df[f"force_ref{i}"].to_numpy(), dtype=torch.float32))
+        else:
+            force_ref_cols.append(2.0 * currents_t[:, i - 1] ** 2 / (gaps_t[:, i - 1] + 0.05) ** 2)
+    force_ref = torch.stack(force_ref_cols, dim=1)
     features = torch.stack(
         [currents_t, gaps_t, flux_density, torch.stack(accel, dim=1), beam_t, torch.stack(temp, dim=1)],
         dim=-1,
@@ -299,4 +323,179 @@ def load_csv_dataset(file_like, num_magnets=4, window=8, beam_points=33):
         flux_density=flux_density,
         boundary=boundary,
         magnet_positions=magnet_positions,
+        force_ref=force_ref,
+        source_type="csv",
+    )
+
+
+def generate_fem_like_validation_dataset(
+    num_magnets=4,
+    steps_per_case=80,
+    window=8,
+    beam_points=33,
+    seed=123,
+):
+    """Generate parameterized FEM-like validation cases when no real export exists."""
+    generator = torch.Generator().manual_seed(seed)
+    magnet_positions = torch.linspace(0.0, 1.0, num_magnets)
+    x_grid = torch.linspace(0.0, 1.0, beam_points)
+    all_t = []
+    all_currents = []
+    all_gap = []
+    all_beam_disp = []
+    all_beam_field = []
+    all_potential = []
+    all_flux = []
+    all_force_ref = []
+    all_features = []
+    all_case_ids = []
+
+    for case_id, (speed_scale, coupling_scale, slot_scale) in enumerate(
+        [(0.8, 0.5, 0.5), (1.0, 1.4, 0.8), (1.25, 1.0, 1.8)]
+    ):
+        t = torch.linspace(0.0, 4.0, steps_per_case).view(-1, 1)
+        phase = torch.arange(num_magnets).float().view(1, -1) * math.pi / max(num_magnets, 1)
+        currents = 2.1 + 0.35 * torch.sin(speed_scale * 2.2 * t + phase)
+        gap = 0.48 + 0.026 * torch.sin(speed_scale * 1.6 * t + phase)
+        if num_magnets > 1:
+            neighbor = torch.zeros_like(gap)
+            neighbor[:, 1:] += gap[:, :-1] - gap[:, 1:]
+            neighbor[:, :-1] += gap[:, 1:] - gap[:, :-1]
+            gap = gap + 0.04 * coupling_scale * neighbor
+        potential = currents / (gap + 0.045) + 0.05 * torch.sin(torch.pi * magnet_positions.view(1, -1))
+        flux = potential + 0.03 * coupling_scale * torch.cos(phase)
+        force_ref = 2.0 * currents ** 2 / (gap + 0.05) ** 2 + slot_scale * 0.8 * flux ** 2
+        beam_disp = 0.012 * torch.sin(speed_scale * 1.2 * t + 0.35 * phase)
+        x_phase = x_grid.view(1, -1)
+        beam_field = (
+            0.01 * torch.sin(torch.pi * x_phase) * torch.sin(speed_scale * 1.2 * t)
+            + 0.003 * slot_scale * torch.sin(3 * torch.pi * x_phase) * torch.cos(1.7 * t)
+        )
+        accel = -0.025 * torch.sin(speed_scale * 1.6 * t + phase)
+        temperature = 24.0 + case_id + 0.6 * torch.sin(0.25 * t + phase)
+        noisy_gap = gap + 0.004 * torch.randn(gap.shape, generator=generator)
+        features = torch.stack([currents, noisy_gap, flux, accel, beam_disp, temperature], dim=-1)
+
+        all_t.append(t + case_id * 5.0)
+        all_currents.append(currents)
+        all_gap.append(gap)
+        all_beam_disp.append(beam_disp)
+        all_beam_field.append(beam_field)
+        all_potential.append(potential)
+        all_flux.append(flux)
+        all_force_ref.append(force_ref)
+        all_features.append(features)
+        all_case_ids.append(torch.full((steps_per_case,), case_id, dtype=torch.long))
+
+    t = torch.cat(all_t, dim=0)
+    currents = torch.cat(all_currents, dim=0)
+    gap = torch.cat(all_gap, dim=0)
+    beam_disp = torch.cat(all_beam_disp, dim=0)
+    beam_field = torch.cat(all_beam_field, dim=0)
+    field_potential = torch.cat(all_potential, dim=0)
+    flux = torch.cat(all_flux, dim=0)
+    force_ref = torch.cat(all_force_ref, dim=0)
+    features = torch.cat(all_features, dim=0)
+    case_ids = torch.cat(all_case_ids, dim=0)
+
+    boundary = {
+        "gap_initial": gap[0].clone(),
+        "beam_left": beam_field[:, 0:1].clone(),
+        "beam_right": beam_field[:, -1:].clone(),
+        "field_left": field_potential[:, 0:1].clone(),
+        "field_right": field_potential[:, -1:].clone(),
+    }
+    return _window_tensor(
+        features,
+        t,
+        currents,
+        gap,
+        beam_disp,
+        window,
+        beam_field=beam_field,
+        x_grid=x_grid,
+        field_potential=field_potential,
+        flux_density=flux,
+        boundary=boundary,
+        magnet_positions=magnet_positions,
+        force_ref=force_ref,
+        case_ids=case_ids,
+        source_type="fem_like",
+    )
+
+
+def load_fem_validation_csv(file_like, window=8, beam_points=33):
+    """Load long-form FEM/COMSOL/ANSYS exports into DatasetBundle.
+
+    Required columns: case_id,time,magnet_id,x,current,gap,flux_density,
+    field_potential,force_ref,beam_disp.
+    """
+    df = pd.read_csv(file_like)
+    required = {
+        "case_id",
+        "time",
+        "magnet_id",
+        "x",
+        "current",
+        "gap",
+        "flux_density",
+        "field_potential",
+        "force_ref",
+        "beam_disp",
+    }
+    missing = required - set(df.columns)
+    if missing:
+        raise ValueError(f"FEM CSV missing columns: {sorted(missing)}")
+
+    df = df.sort_values(["case_id", "time", "magnet_id"])
+    magnets = sorted(df["magnet_id"].unique())
+    num_magnets = len(magnets)
+    index_cols = ["case_id", "time"]
+
+    def pivot_value(column):
+        pivot = df.pivot_table(index=index_cols, columns="magnet_id", values=column, aggfunc="mean")
+        return torch.tensor(pivot[magnets].to_numpy(), dtype=torch.float32)
+
+    grouped = df[index_cols].drop_duplicates().sort_values(index_cols)
+    t = torch.tensor(grouped["time"].to_numpy(), dtype=torch.float32).view(-1, 1)
+    case_ids = torch.tensor(grouped["case_id"].astype("category").cat.codes.to_numpy(), dtype=torch.long)
+    currents = pivot_value("current")
+    gaps = pivot_value("gap")
+    flux = pivot_value("flux_density")
+    potential = pivot_value("field_potential")
+    force_ref = pivot_value("force_ref")
+    beam_disp = pivot_value("beam_disp")
+    accel = torch.zeros_like(gaps)
+    temperature = torch.full_like(gaps, 25.0)
+    features = torch.stack([currents, gaps, flux, accel, beam_disp, temperature], dim=-1)
+
+    magnet_positions = torch.tensor(
+        [df.loc[df["magnet_id"] == magnet, "x"].mean() for magnet in magnets],
+        dtype=torch.float32,
+    )
+    x_grid = torch.linspace(float(magnet_positions.min()), float(magnet_positions.max()), beam_points)
+    beam_field = _project_magnet_values_to_grid(beam_disp, magnet_positions, x_grid)
+    boundary = {
+        "gap_initial": gaps[0].clone(),
+        "beam_left": beam_field[:, 0:1].clone(),
+        "beam_right": beam_field[:, -1:].clone(),
+        "field_left": potential[:, 0:1].clone(),
+        "field_right": potential[:, -1:].clone(),
+    }
+    return _window_tensor(
+        features,
+        t,
+        currents,
+        gaps,
+        beam_disp,
+        window,
+        beam_field=beam_field,
+        x_grid=x_grid,
+        field_potential=potential,
+        flux_density=flux,
+        boundary=boundary,
+        magnet_positions=magnet_positions,
+        force_ref=force_ref,
+        case_ids=case_ids,
+        source_type="fem_csv",
     )

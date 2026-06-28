@@ -1,5 +1,4 @@
 import io
-import math
 import os
 import sys
 import time
@@ -15,9 +14,16 @@ if PROJECT_ROOT not in sys.path:
     sys.path.insert(0, PROJECT_ROOT)
 
 from core.baselines import compare_with_newmark
-from core.data import FEATURE_COLUMNS, generate_multimagnet_dataset, load_csv_dataset
+from core.data import (
+    FEATURE_COLUMNS,
+    generate_fem_like_validation_dataset,
+    generate_multimagnet_dataset,
+    load_csv_dataset,
+    load_fem_validation_csv,
+)
 from core.evaluator import evaluate_splits, regression_metrics
 from core.experiments import flatten_split_metrics, save_experiment_record
+from core.field import compute_field_quantities
 from services.maglev_service import MaglevService
 
 
@@ -35,8 +41,15 @@ MODE_LABELS = {
     "self_supervised": "Self-supervised 物理自学习",
 }
 
+FIELD_MODE_LABELS = {
+    "engineering": "工程力",
+    "legacy_gradient": "旧梯度代理力",
+    "maxwell_stress": "Maxwell 应力近似力",
+    "blended": "工程力 + Maxwell 混合",
+}
 
-def build_params(kc, use_structural_loss, lambda_physics, lambda_reconstruction, field_force_blend):
+
+def build_params(kc, use_structural_loss, lambda_physics, lambda_reconstruction, field_force_model, field_force_blend):
     return {
         "m": 1.0,
         "g": 9.81,
@@ -53,8 +66,13 @@ def build_params(kc, use_structural_loss, lambda_physics, lambda_reconstruction,
         "field_div_scale": 1e-4,
         "field_flux_scale": 1e-3,
         "field_boundary_scale": 1e-3,
+        "field_force_model": field_force_model,
         "field_force_blend": field_force_blend,
         "field_force_scale": 0.1,
+        "mu0": 4 * 3.141592653589793 * 1e-7,
+        "pole_area": 0.01,
+        "force_normal": 1.0,
+        "maxwell_force_scale": 1e-5,
         "use_structural_loss": use_structural_loss,
         "lambda_physics": lambda_physics,
         "lambda_reconstruction": lambda_reconstruction,
@@ -62,8 +80,11 @@ def build_params(kc, use_structural_loss, lambda_physics, lambda_reconstruction,
         "grad_clip": 5.0,
         "rho_a": 1.0,
         "beam_c": 0.08,
-        "beam_k": 8.0,
+        "beam_ei": 8.0,
+        "functional_ei_scale": 0.75,
+        "joint_ei_scale": 0.55,
         "slot_amp": 0.03,
+        "slot_harmonics": 3,
         "slot_pitch": 0.6,
     }
 
@@ -171,6 +192,29 @@ def render_attention(full_output):
         c2.pyplot(fig)
 
 
+def render_force_comparison(dataset, params, magnet_index=0):
+    engineering = params["k"] * dataset.currents ** 2 / (torch.clamp(dataset.target_gap, min=1e-4) + params["epsilon"]) ** 2
+    field = compute_field_quantities(
+        dataset.target_gap,
+        dataset.currents,
+        dataset.magnet_positions,
+        params,
+        field_potential=dataset.field_potential,
+    )
+    fig, ax = plt.subplots(figsize=(8, 4))
+    t_np = dataset.t.detach().cpu().numpy().reshape(-1)
+    ax.plot(t_np, engineering[:, magnet_index].detach().cpu().numpy(), label="工程力")
+    ax.plot(t_np, field["maxwell_force"][:, magnet_index].detach().cpu().numpy(), label="Maxwell 应力近似力")
+    if dataset.force_ref is not None:
+        ax.plot(t_np, dataset.force_ref[:, magnet_index].detach().cpu().numpy(), "k--", alpha=0.65, label="force_ref")
+    ax.set_title(f"电磁铁 {magnet_index + 1} 力模型对比")
+    ax.set_xlabel("时间 / s")
+    ax.set_ylabel("力 / proxy unit")
+    ax.legend()
+    ax.grid(True, linestyle="--", alpha=0.3)
+    st.pyplot(fig)
+
+
 def split_metrics_dataframe(metrics):
     rows = []
     for split_name, values in metrics.items():
@@ -181,7 +225,11 @@ def split_metrics_dataframe(metrics):
 
 
 st.sidebar.header("数据与模型配置")
-data_source = st.sidebar.radio("数据来源", ["增强仿真数据", "上传 CSV"], horizontal=False)
+data_source = st.sidebar.radio(
+    "数据来源",
+    ["增强仿真数据", "FEM-like 半真实验证集", "上传宽表 CSV", "上传 FEM 长表 CSV"],
+    horizontal=False,
+)
 num_magnets = st.sidebar.slider("电磁铁数量", 2, 8, 4)
 beam_points = st.sidebar.slider("梁 PDE 配点数", 9, 65, 33, step=4)
 window = st.sidebar.slider("时间窗口长度", 4, 16, 8)
@@ -192,17 +240,37 @@ sample_ratio = st.sidebar.slider("小样本比例", 0.25, 1.0, 0.75, step=0.05)
 kc = st.sidebar.slider("相邻电磁铁耦合刚度 kc", 0.0, 5.0, 1.5, step=0.1)
 lambda_physics = st.sidebar.slider("物理损失权重", 0.0, 1.0, 0.2, step=0.05)
 lambda_reconstruction = st.sidebar.slider("重构损失权重", 0.0, 0.5, 0.05, step=0.01)
-field_force_blend = st.sidebar.slider("磁场代理力混合系数", 0.0, 1.0, 0.2, step=0.05)
+field_force_model = st.sidebar.selectbox(
+    "场力模型",
+    list(FIELD_MODE_LABELS.keys()),
+    index=3,
+    format_func=lambda key: FIELD_MODE_LABELS[key],
+)
+field_force_blend = st.sidebar.slider("Maxwell 力混合系数", 0.0, 1.0, 0.3, step=0.05)
 use_structural_loss = st.sidebar.checkbox("启用梁/齿槽结构动力学残差", value=False)
 
-params = build_params(kc, use_structural_loss, lambda_physics, lambda_reconstruction, field_force_blend)
+params = build_params(kc, use_structural_loss, lambda_physics, lambda_reconstruction, field_force_model, field_force_blend)
 
-if data_source == "上传 CSV":
+if data_source == "上传宽表 CSV":
     uploaded_file = st.sidebar.file_uploader("上传工况 CSV", type=["csv"])
     if uploaded_file is None:
-        st.warning("请上传包含 t、I1..IN、gap1..gapN 的 CSV 文件。")
+        st.warning("请上传包含 t、I1..IN、gap1..gapN 的宽表 CSV 文件。")
         st.stop()
     dataset = load_csv_dataset(uploaded_file, num_magnets=num_magnets, window=window, beam_points=beam_points)
+elif data_source == "上传 FEM 长表 CSV":
+    uploaded_file = st.sidebar.file_uploader("上传 FEM/COMSOL/ANSYS 长表 CSV", type=["csv"])
+    if uploaded_file is None:
+        st.warning("请上传包含 case_id,time,magnet_id,x,current,gap,flux_density,field_potential,force_ref,beam_disp 的 CSV 文件。")
+        st.stop()
+    dataset = load_fem_validation_csv(uploaded_file, window=window, beam_points=beam_points)
+    num_magnets = dataset.currents.shape[1]
+elif data_source == "FEM-like 半真实验证集":
+    dataset = generate_fem_like_validation_dataset(
+        num_magnets=num_magnets,
+        steps_per_case=80,
+        window=window,
+        beam_points=beam_points,
+    )
 else:
     dataset = generate_multimagnet_dataset(
         num_magnets=num_magnets,
@@ -215,8 +283,8 @@ else:
 
 split_sizes = {name: len(indices) for name, indices in dataset.split_indices.items()}
 st.caption(
-    f"当前张量: seq={tuple(dataset.seq.shape)}, target={tuple(dataset.target_gap.shape)}, "
-    f"x_grid={tuple(dataset.x_grid.shape)}, split={split_sizes}"
+    f"数据源={dataset.source_type}, seq={tuple(dataset.seq.shape)}, target={tuple(dataset.target_gap.shape)}, "
+    f"x_grid={tuple(dataset.x_grid.shape)}, cases={len(dataset.case_ids.unique())}, split={split_sizes}"
 )
 
 tab_train, tab_compare, tab_deploy = st.tabs(["模型训练与评估", "算法对比", "离线推理与监测"])
@@ -224,7 +292,7 @@ tab_train, tab_compare, tab_deploy = st.tabs(["模型训练与评估", "算法�
 with tab_train:
     mode = st.radio("训练模式", list(MODE_LABELS.keys()), format_func=lambda x: MODE_LABELS[x], horizontal=True)
     if st.button("启动训练", type="primary", key="train_one"):
-        service = make_service(params, num_magnets, window, latent_dim)
+        service = make_service(params, dataset.currents.shape[1], window, latent_dim)
         with st.spinner("正在训练多电磁铁 PINN 原型..."):
             history = train_service(service, dataset, mode, epochs)
 
@@ -243,9 +311,11 @@ with tab_train:
         with c1:
             render_history(history)
             render_latent(full, dataset.t)
+            render_force_comparison(dataset, params, 0)
         with c2:
-            magnet_index = st.slider("查看电磁铁编号", 1, num_magnets, 1, key="single_magnet") - 1
+            magnet_index = st.slider("查看电磁铁编号", 1, dataset.currents.shape[1], 1, key="single_magnet") - 1
             render_prediction(dataset.t, dataset.target_gap, pred, magnet_index)
+            render_force_comparison(dataset, params, magnet_index)
             render_attention(full)
 
         buffer = io.BytesIO()
@@ -253,7 +323,7 @@ with tab_train:
         st.download_button(
             "下载当前模型权重",
             data=buffer.getvalue(),
-            file_name=f"maglev_{mode}_{num_magnets}m.pth",
+            file_name=f"maglev_{mode}_{dataset.currents.shape[1]}m.pth",
             mime="application/octet-stream",
         )
 
@@ -265,7 +335,7 @@ with tab_compare:
         progress = st.progress(0)
         mode_order = ["data_only", "pinn", "ae_pinn", "self_supervised"]
         for idx, mode_name in enumerate(mode_order, start=1):
-            service = make_service(params, num_magnets, window, latent_dim)
+            service = make_service(params, dataset.currents.shape[1], window, latent_dim)
             start = time.perf_counter()
             history = train_service(service, dataset, mode_name, epochs)
             elapsed_ms = (time.perf_counter() - start) * 1000.0
@@ -273,6 +343,8 @@ with tab_compare:
             split_metrics = evaluate_splits(service.model, dataset)
             row = {"模式": MODE_LABELS[mode_name]}
             row.update(flatten_split_metrics(split_metrics))
+            if dataset.force_ref is not None:
+                row["force_ref_MAE"] = torch.mean(torch.abs(dataset.force_ref - params["k"] * dataset.currents ** 2 / (dataset.target_gap + params["epsilon"]) ** 2)).item()
             row["最终总损失"] = history["total"][-1]
             row["最终物理残差"] = history["physics"][-1]
             row["最终重构损失"] = history["reconstruction"][-1]
@@ -285,6 +357,7 @@ with tab_compare:
                 "timestamp": time.strftime("%Y-%m-%d %H:%M:%S"),
                 "mode": mode_name,
                 "params": params,
+                "source_type": dataset.source_type,
                 "elapsed_ms": elapsed_ms,
                 "final_loss": history["total"][-1],
                 "final_components": {
@@ -308,19 +381,8 @@ with tab_compare:
             st.dataframe(
                 pd.DataFrame(
                     [
-                        {
-                            "方法": baseline_info["method"],
-                            "MSE": baseline_metrics["MSE"],
-                            "RMSE": baseline_metrics["RMSE"],
-                            "MAE": baseline_metrics["MAE"],
-                            "R2": baseline_metrics["R2"],
-                            "耗时 ms": baseline_info["elapsed_ms"],
-                        },
-                        {
-                            "方法": "AE-PINN",
-                            **regression_metrics(dataset.target_gap, preds["ae_pinn"]),
-                            "耗时 ms": None,
-                        },
+                        {"方法": baseline_info["method"], **baseline_metrics, "耗时 ms": baseline_info["elapsed_ms"]},
+                        {"方法": "AE-PINN", **regression_metrics(dataset.target_gap, preds["ae_pinn"]), "耗时 ms": None},
                     ]
                 ).set_index("方法"),
                 use_container_width=True,
@@ -340,12 +402,12 @@ with tab_compare:
 with tab_deploy:
     st.subheader("离线模型加载")
     model_file = st.file_uploader("上传 .pth 权重", type=["pth"], key="model_upload")
-    test_file = st.file_uploader("上传待测 CSV", type=["csv"], key="test_upload")
+    test_file = st.file_uploader("上传待测宽表 CSV", type=["csv"], key="test_upload")
     if model_file and test_file and st.button("执行离线推理", type="primary"):
-        service = make_service(params, num_magnets, window, latent_dim)
+        service = make_service(params, dataset.currents.shape[1], window, latent_dim)
         try:
             service.model.load_state_dict(torch.load(io.BytesIO(model_file.read()), map_location="cpu"))
-            test_data = load_csv_dataset(test_file, num_magnets=num_magnets, window=window, beam_points=beam_points)
+            test_data = load_csv_dataset(test_file, num_magnets=dataset.currents.shape[1], window=window, beam_points=beam_points)
             start = time.time()
             pred = service.predict(test_data.seq, test_data.t, test_data.currents)
             elapsed = (time.time() - start) * 1000
