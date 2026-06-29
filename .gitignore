@@ -21,3 +21,4 @@ env/
 outputs/
 artifacts/
 streamlit_*.log
+logs/
